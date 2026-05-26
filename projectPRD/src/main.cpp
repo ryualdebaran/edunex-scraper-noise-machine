@@ -8,353 +8,183 @@
 #include <WiFiUdp.h>
 
 // ============================================================
-// CONSTANTS
+// CONFIG
 // ============================================================
-const int SCROLL_INTERVAL = 8000;
-const int FETCH_INTERVAL  = 1800000;
-const int MARQUEE_SPEED   = 350;
-const int BUZZER_PIN      = 23;
-const int MUTE_PIN        = 18;
-const int MUTE_DURATION   = 600000;
-const int UDP_PORT        = 4210;
-const int LCD_COLS        = 16;
+const int SCROLL_MS  = 8000;
+const int FETCH_MS   = 1800000;
+const int MARQUEE_MS = 350;
+const int ALARM_MS   = 300000;
+const int BUZZER_PIN = 23;
+const int UDP_PORT   = 4210;
 
 // ============================================================
-// GLOBALS
+// HARDWARE
 // ============================================================
-LiquidCrystal_I2C lcd(0x27, LCD_COLS, 2);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
 WiFiUDP udp;
 
-char serverURL[80] = "";
-long serverTimeOffset = 0;
+// ============================================================
+// STATE
+// ============================================================
+char  serverURL[80] = "";
+long  timeOffset    = 0;
+bool  hasUnanswered = false;
+bool  alarmActive   = false;
+bool  showChaos     = false;
+int   currentIndex  = 0;
+int   chaosPhase    = 0;
+int   chaosLcdIndex = 0;
+
+unsigned long lastScroll   = 0;
+unsigned long lastFetch    = 0;
+unsigned long lastBuzzer   = 0;
+unsigned long lastChaosLcd = 0;
+unsigned long lastMarquee  = 0;
+unsigned long alarmStarted = 0;
 
 struct Assignment {
-  String title;
-  String deadline;
-  String status;
+  String title, deadline, status;
   long   deadlineEpoch;
 };
-
 Assignment assignments[20];
-int  totalAssignments = 0;
-int  currentIndex     = 0;
-bool hasUnanswered    = false;
-bool isMuted          = false;
+int totalAssignments = 0;
 
-unsigned long lastScroll    = 0;
-unsigned long lastFetch     = 0;
-unsigned long lastBuzzer    = 0;
-unsigned long lastLcdChaos  = 0;
-unsigned long lastDebounce  = 0;
-unsigned long lastMarquee   = 0;
-unsigned long muteUntil     = 0;
-
-int  chaosPhase    = 0;
-int  chaosLcdIndex = 0;
-bool showChaos     = false;
-
-// Per-row marquee state
-struct MarqueeState {
-  int  offset    = 0;
-  bool active    = false;
-  String text    = "";
-};
-
-MarqueeState row0State;
-MarqueeState row1State;
+struct MarqueeState { int offset = 0; bool active = false; String text = ""; };
+MarqueeState row0, row1;
 
 // ============================================================
-// MARQUEE HELPERS
+// MARQUEE
 // ============================================================
-
-// Set text for a row — auto-enables marquee if text > 16 chars
-void setRow(int row, String text) {
-  MarqueeState& s = (row == 0) ? row0State : row1State;
-  s.text   = text;
-  s.offset = 0;
-
-  if (text.length() <= LCD_COLS) {
-    // Short text — pad and print immediately, no scroll
-    s.active = false;
+void setRow(int r, String text) {
+  MarqueeState& s = r ? row1 : row0;
+  s = {0, text.length() > 16, text};
+  if (!s.active) {
     char buf[17];
     snprintf(buf, sizeof(buf), "%-16s", text.c_str());
-    lcd.setCursor(0, row);
+    lcd.setCursor(0, r);
     lcd.print(buf);
-  } else {
-    s.active = true;
   }
 }
 
-// Advance marquee one step for a row
-void tickRow(int row) {
-  MarqueeState& s = (row == 0) ? row0State : row1State;
+void tickRow(int r) {
+  MarqueeState& s = r ? row1 : row0;
   if (!s.active) return;
-
-  String scrollText = s.text + "    ";
-  int    scrollLen  = scrollText.length();
-  String visible    = "";
-
-  for (int i = 0; i < LCD_COLS; i++) {
-    visible += scrollText[(s.offset + i) % scrollLen];
-  }
-
-  lcd.setCursor(0, row);
-  lcd.print(visible);
-  s.offset = (s.offset + 1) % scrollLen;
+  String t = s.text + "    ";
+  String v = "";
+  for (int i = 0; i < 16; i++) v += t[(s.offset + i) % t.length()];
+  lcd.setCursor(0, r);
+  lcd.print(v);
+  s.offset = (s.offset + 1) % t.length();
 }
 
-// Tick both rows
-void tickMarquee() {
-  tickRow(0);
-  tickRow(1);
+void showLoading(String label, int dot) {
+  String s = label;
+  for (int i = 0; i < (dot % 4) + 1; i++) s += ".";
+  setRow(1, s);
 }
 
 // ============================================================
 // BUZZER
 // ============================================================
-void beepSOS() {
-  for (int i = 0; i < 3; i++) { digitalWrite(BUZZER_PIN, HIGH); delay(100); digitalWrite(BUZZER_PIN, LOW); delay(80); }
-  delay(200);
-  for (int i = 0; i < 3; i++) { digitalWrite(BUZZER_PIN, HIGH); delay(400); digitalWrite(BUZZER_PIN, LOW); delay(100); }
-  delay(200);
-  for (int i = 0; i < 3; i++) { digitalWrite(BUZZER_PIN, HIGH); delay(100); digitalWrite(BUZZER_PIN, LOW); delay(80); }
-}
+void beep(int ms) { digitalWrite(BUZZER_PIN, HIGH); delay(ms); digitalWrite(BUZZER_PIN, LOW); }
 
 void beepPanic() {
-  int pattern[] = {50, 30, 200, 50, 50, 300, 80, 40};
-  int gaps[]    = {30, 20, 100, 30, 20, 150, 40, 30};
-  for (int i = 0; i < 8; i++) {
-    digitalWrite(BUZZER_PIN, HIGH); delay(pattern[i]);
-    digitalWrite(BUZZER_PIN, LOW);  delay(gaps[i]);
-  }
-}
-
-void beepAlarm() {
-  for (int i = 0; i < 5; i++) {
-    digitalWrite(BUZZER_PIN, HIGH); delay(80);
-    digitalWrite(BUZZER_PIN, LOW);  delay(40);
-    digitalWrite(BUZZER_PIN, HIGH); delay(160);
-    digitalWrite(BUZZER_PIN, LOW);  delay(40);
-  }
-}
-
-void beepAlert() {
-  for (int i = 0; i < 3; i++) {
-    digitalWrite(BUZZER_PIN, HIGH); delay(150);
-    digitalWrite(BUZZER_PIN, LOW);  delay(100);
-  }
+  int p[] = {50,30,200,50,50,300,80,40}, g[] = {30,20,100,30,20,150,40,30};
+  for (int i = 0; i < 8; i++) { beep(p[i]); delay(g[i]); }
 }
 
 void beepChaos() {
-  switch (chaosPhase % 4) {
-    case 0: beepPanic();              break;
-    case 1: beepSOS();                break;
-    case 2: beepAlarm();              break;
-    case 3: beepPanic(); beepAlarm(); break;
+  beepPanic();
+  if (chaosPhase++ % 2 == 0) beepPanic();
+}
+
+// ============================================================
+// TIME
+// ============================================================
+long nowEpoch() { return millis() / 1000 + timeOffset; }
+
+long parseDeadline(String d) {
+  if (d.length() < 14) return 0;
+  int dd = d.substring(0,2).toInt(), mm = d.substring(3,5).toInt();
+  int yy = d.substring(6,8).toInt() + 2000;
+  int hh = d.substring(9,11).toInt(), mn = d.substring(12,14).toInt();
+  int dim[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+  long days = (yy-1970)*365L;
+  for (int y = 1970; y < yy; y++) if ((y%4==0&&y%100!=0)||(y%400==0)) days++;
+  for (int m = 0; m < mm-1; m++) { days += dim[m]; if (m==1&&((yy%4==0&&yy%100!=0)||(yy%400==0))) days++; }
+  return (days+dd-1)*86400L + hh*3600L + mn*60L;
+}
+
+String formatCountdown(long s) {
+  if (s <= 0) return "OVERDUE!";
+  char buf[32];
+  if      (s >= 86400) snprintf(buf, sizeof(buf), "%ldd %ldh left", s/86400, (s%86400)/3600);
+  else if (s >= 3600)  snprintf(buf, sizeof(buf), "%ldh %ldm left", s/3600, (s%3600)/60);
+  else                 snprintf(buf, sizeof(buf), "%ldm left!", s/60);
+  return String(buf);
+}
+
+bool syncTime() {
+  String url = String(serverURL);
+  url = url.substring(0, url.lastIndexOf('/')) + "/time";
+  HTTPClient http;
+  http.begin(url);
+  http.setTimeout(10000);
+  if (http.GET() != HTTP_CODE_OK) { http.end(); return false; }
+  DynamicJsonDocument doc(128);
+  if (deserializeJson(doc, http.getString())) { http.end(); return false; }
+  http.end();
+  timeOffset = (long)doc["timestamp"] - (long)(millis()/1000);
+  Serial.println("Time synced. Offset: " + String(timeOffset));
+  return true;
+}
+
+// ============================================================
+// DISPLAY
+// ============================================================
+void displayAssignment(int idx) {
+  if (totalAssignments == 0) {
+    lcd.clear();
+    setRow(0, "All done! (^_^)");
+    setRow(1, "No pending tasks");
+    return;
   }
-  chaosPhase++;
+  char prefix[7];
+  snprintf(prefix, sizeof(prefix), "[%d/%d] ", idx+1, totalAssignments);
+  setRow(0, String(prefix) + assignments[idx].title);
+  setRow(1, formatCountdown(assignments[idx].deadlineEpoch - nowEpoch()));
+}
+
+// ============================================================
+// ALARM
+// ============================================================
+void startAlarm() {
+  if (alarmActive) return;
+  alarmActive = true; alarmStarted = millis();
+  beep(150); delay(100); beep(150); delay(100); beep(150);
+  Serial.println("Alarm started.");
+}
+
+void checkAlarm() {
+  if (!alarmActive) return;
+  if (millis() - alarmStarted >= ALARM_MS) {
+    alarmActive = showChaos = false;
+    Serial.println("Alarm stopped.");
+    displayAssignment(currentIndex);
+  }
 }
 
 // ============================================================
 // CHAOS LCD
 // ============================================================
 const char* chaosMessages[] = {
-  "!! DEADLINE !!",
   "SUBMIT OR FAIL",
-  "WHY R U READING",
   "GO DO UR TASK!!",
-  "TUGAS MENUNGGU!",
   "WAKTU HABIS!!!",
   "PANIK SEKARANG!",
-  "NO MORE MENFESS",
   "GG EZ NO REMATCH",
 };
-const int chaosCount = 9;
-
-void flashChaosMessage() {
-  setRow(0, String(chaosMessages[chaosLcdIndex % chaosCount]));
-  chaosLcdIndex++;
-  showChaos = true;
-}
-
-void restoreNormal() {
-  showChaos = false;
-}
-
-// ============================================================
-// TIME
-// ============================================================
-long getNowEpoch() {
-  return (millis() / 1000) + serverTimeOffset;
-}
-
-bool syncTime() {
-  String base    = String(serverURL);
-  String timeURL = base.substring(0, base.lastIndexOf('/')) + "/time";
-  Serial.println("Syncing time from: " + timeURL);
-
-  HTTPClient http;
-  http.begin(timeURL);
-  http.setTimeout(10000);
-  int code = http.GET();
-
-  if (code != HTTP_CODE_OK) {
-    Serial.println("Time sync failed: " + String(code));
-    http.end();
-    return false;
-  }
-
-  DynamicJsonDocument doc(128);
-  DeserializationError error = deserializeJson(doc, http.getString());
-  http.end();
-
-  if (error) { Serial.println("Time parse failed"); return false; }
-
-  long serverNow   = doc["timestamp"];
-  serverTimeOffset = serverNow - (long)(millis() / 1000);
-  Serial.println("Time synced. Offset: " + String(serverTimeOffset));
-  return true;
-}
-
-long parseDeadline(String deadline) {
-  if (deadline.length() < 14) return 0;
-  int dd = deadline.substring(0, 2).toInt();
-  int mm = deadline.substring(3, 5).toInt();
-  int yy = deadline.substring(6, 8).toInt() + 2000;
-  int hh = deadline.substring(9, 11).toInt();
-  int mn = deadline.substring(12, 14).toInt();
-
-  int daysInMonth[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-  long days = (yy - 1970) * 365L;
-  for (int y = 1970; y < yy; y++) {
-    if ((y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)) days++;
-  }
-  for (int m = 0; m < mm - 1; m++) {
-    days += daysInMonth[m];
-    if (m == 1 && ((yy % 4 == 0 && yy % 100 != 0) || (yy % 400 == 0))) days++;
-  }
-  days += dd - 1;
-  return days * 86400L + hh * 3600L + mn * 60L;
-}
-
-String formatCountdown(long secondsLeft) {
-  if (secondsLeft <= 0) return "OVERDUE!";
-  long days  = secondsLeft / 86400;
-  long hours = (secondsLeft % 86400) / 3600;
-  long mins  = (secondsLeft % 3600) / 60;
-  char buf[32];
-  if (days > 0)       snprintf(buf, sizeof(buf), "%ldd %ldh remaining", days, hours);
-  else if (hours > 0) snprintf(buf, sizeof(buf), "%ldh %ldm remaining", hours, mins);
-  else                snprintf(buf, sizeof(buf), "%ldm remaining!", mins);
-  return String(buf);
-}
-
-// ============================================================
-// MUTE
-// ============================================================
-void checkMuteButton() {
-  if (digitalRead(MUTE_PIN) == LOW && millis() - lastDebounce > 200) {
-    lastDebounce = millis();
-    isMuted      = true;
-    muteUntil    = millis() + MUTE_DURATION;
-    Serial.println("Muted for 10 minutes.");
-
-    lcd.clear();
-    setRow(0, "Muted 10 min!");
-    setRow(1, "Enjoy the quiet");
-    delay(1500);
-    restoreNormal();
-  }
-
-  if (isMuted && millis() > muteUntil) {
-    isMuted = false;
-    Serial.println("Mute lifted. CHAOS RESUMES.");
-
-    lcd.clear();
-    setRow(0, "Mute lifted!");
-    setRow(1, "Back to chaos...");
-    delay(1000);
-    restoreNormal();
-    if (hasUnanswered) beepAlert();
-  }
-}
-
-void showMuteStatus() {
-  if (!isMuted) return;
-  unsigned long remaining = (muteUntil - millis()) / 1000;
-  unsigned long mins = remaining / 60;
-  unsigned long secs = remaining % 60;
-
-  char row0buf[32];
-  snprintf(row0buf, sizeof(row0buf), "[MUTE] %02lu:%02lu left", mins, secs);
-  setRow(0, String(row0buf));
-
-  if (totalAssignments > 0) {
-    setRow(1, assignments[currentIndex].title);
-  }
-}
-
-// ============================================================
-// UDP DISCOVERY
-// ============================================================
-bool discoverServer() {
-  lcd.clear();
-  setRow(0, "Finding server..");
-  setRow(1, "Please wait...");
-
-  udp.begin(UDP_PORT);
-  Serial.println("Listening for server broadcast...");
-
-  unsigned long start    = millis();
-  unsigned long lastDot  = 0;
-  int dotCount           = 0;
-
-  while (millis() - start < 15000) {
-    if (millis() - lastDot > 500) {
-      String dots = "Searching";
-      for (int i = 0; i < (dotCount % 4); i++) dots += ".";
-      setRow(1, dots);
-      dotCount++;
-      lastDot = millis();
-    }
-
-    int packetSize = udp.parsePacket();
-    if (packetSize) {
-      char buf[80];
-      int  len = udp.read(buf, sizeof(buf) - 1);
-      buf[len] = '\0';
-      String msg = String(buf);
-      Serial.println("UDP received: " + msg);
-
-      if (msg.startsWith("DEADLINE_SERVER:")) {
-        String rest  = msg.substring(16);
-        int colonIdx = rest.indexOf(':');
-        String ip    = rest.substring(0, colonIdx);
-        String port  = rest.substring(colonIdx + 1);
-
-        snprintf(serverURL, sizeof(serverURL), "http://%s:%s/data", ip.c_str(), port.c_str());
-        Serial.println("Server found: " + String(serverURL));
-
-        lcd.clear();
-        setRow(0, "Server found!");
-        setRow(1, ip);
-        delay(1500);
-
-        udp.stop();
-        return true;
-      }
-    }
-    delay(100);
-  }
-
-  udp.stop();
-  Serial.println("Server not found!");
-  lcd.clear();
-  setRow(0, "No server found!");
-  setRow(1, "Start server.py");
-  delay(2000);
-  return false;
-}
+const int CHAOS_COUNT = 5;
 
 // ============================================================
 // WIFI
@@ -365,42 +195,83 @@ void connectWifi() {
   setRow(1, "Please wait...");
 
   WiFiManager wm;
-
-  wm.setAPCallback([](WiFiManager* wm) {
-    Serial.println("Config mode! Connect to ESP32-Setup");
-    lcd.clear();
-    setRow(0, "1.Join ESP32-Set");
-    setRow(1, "2.Open 192.168.4.1");
+  wm.setAPCallback([](WiFiManager*) {
+    const char* slides[][2] = {
+      {"Setup WiFi",    "via hotspot"},
+      {"1. Join WiFi:", "ESP32-Setup"},
+      {"2. Open:",      "192.168.4.1"},
+      {"3. Pilih WiFi", "& isi password"},
+      {"4. Klik Save",  "lalu tunggu..."},
+    };
+    int idx = 0;
+    while (WiFi.status() != WL_CONNECTED) {
+      lcd.clear();
+      lcd.setCursor(0, 0); lcd.print(slides[idx % 5][0]);
+      lcd.setCursor(0, 1); lcd.print(slides[idx % 5][1]);
+      idx++; delay(2500);
+    }
   });
 
   wm.setConfigPortalTimeout(180);
-  bool connected = wm.autoConnect("ESP32-Setup");
-
-  if (!connected) {
-    Serial.println("WiFiManager timeout, restarting...");
-    lcd.clear();
-    setRow(0, "WiFi timeout!");
-    setRow(1, "Restarting...");
-    delay(2000);
-    ESP.restart();
+  if (!wm.autoConnect("ESP32-Setup")) {
+    lcd.clear(); setRow(0, "WiFi timeout!"); setRow(1, "Restarting...");
+    delay(2000); ESP.restart();
   }
-
-  Serial.println("Connected! IP: " + WiFi.localIP().toString());
 
   lcd.clear();
   setRow(0, "WiFi Connected!");
   setRow(1, WiFi.localIP().toString());
   delay(1500);
+  Serial.println("WiFi: " + WiFi.localIP().toString());
+}
+
+// ============================================================
+// UDP DISCOVERY
+// ============================================================
+bool discoverServer() {
+  lcd.clear();
+  setRow(0, "Finding server..");
+
+  udp.begin(UDP_PORT);
+  unsigned long start   = millis();
+  unsigned long lastDot = 0;
+  int dot = 0;
+
+  while (millis() - start < 15000) {
+    if (millis() - lastDot >= 500) {
+      showLoading("Searching", dot++);
+      lastDot = millis();
+    }
+
+    int sz = udp.parsePacket();
+    if (sz) {
+      char buf[80]; int len = udp.read(buf, sizeof(buf)-1); buf[len] = '\0';
+      String msg = String(buf);
+      if (msg.startsWith("DEADLINE_SERVER:")) {
+        String rest = msg.substring(16);
+        int c = rest.indexOf(':');
+        snprintf(serverURL, sizeof(serverURL), "http://%s:%s/data",
+          rest.substring(0,c).c_str(), rest.substring(c+1).c_str());
+        lcd.clear(); setRow(0, "Server found!"); setRow(1, rest.substring(0,c));
+        delay(1500); udp.stop();
+        Serial.println("Server: " + String(serverURL));
+        return true;
+      }
+    }
+    delay(100);
+  }
+
+  udp.stop();
+  lcd.clear(); setRow(0, "No server found!"); setRow(1, "Start server.py");
+  delay(2000);
+  return false;
 }
 
 // ============================================================
 // FETCH
 // ============================================================
 bool fetchAssignments() {
-  if (WiFi.status() != WL_CONNECTED) {
-    connectWifi();
-    return false;
-  }
+  if (WiFi.status() != WL_CONNECTED) { connectWifi(); return false; }
 
   lcd.clear();
   setRow(0, "Fetching data...");
@@ -409,102 +280,48 @@ bool fetchAssignments() {
   http.begin(serverURL);
   http.setTimeout(60000);
 
-  volatile bool fetchDone  = false;
-  volatile int  httpResult = 0;
+  volatile bool done = false;
+  volatile int  code = 0;
   String payload = "";
 
-  struct FetchParams {
-    HTTPClient*   http;
-    volatile bool* done;
-    volatile int*  code;
-    String*        payload;
-  };
-
-  FetchParams params = { &http, &fetchDone, &httpResult, &payload };
+  struct P { HTTPClient* h; volatile bool* d; volatile int* c; String* p; };
+  P params = {&http, &done, &code, &payload};
 
   xTaskCreate([](void* arg) {
-    FetchParams* p  = (FetchParams*)arg;
-    *(p->code)      = p->http->GET();
-    if (*(p->code) == HTTP_CODE_OK) *(p->payload) = p->http->getString();
-    p->http->end();
-    *(p->done) = true;
-    vTaskDelete(NULL);
-  }, "fetchTask", 8192, &params, 1, NULL);
+    P* p = (P*)arg;
+    *(p->c) = p->h->GET();
+    if (*(p->c) == HTTP_CODE_OK) *(p->p) = p->h->getString();
+    p->h->end(); *(p->d) = true; vTaskDelete(NULL);
+  }, "fetch", 8192, &params, 1, NULL);
 
-  int dotCount = 0;
-  while (!fetchDone) {
-    String dots = "Scraping";
-    for (int i = 0; i < (dotCount % 4) + 1; i++) dots += ".";
-    setRow(1, dots);
-    dotCount++;
+  int dot = 0;
+  while (!done) {
+    showLoading("Scraping", dot++);
     delay(400);
   }
 
-  Serial.println("HTTP Code: " + String(httpResult));
-
-  if (httpResult != HTTP_CODE_OK) {
-    Serial.println("Fetch failed!");
-    setRow(1, "Fetch failed!");
-    delay(1000);
-    return false;
-  }
+  if (code != HTTP_CODE_OK) { setRow(1, "Fetch failed!"); delay(1000); return false; }
 
   DynamicJsonDocument doc(2048);
-  DeserializationError error = deserializeJson(doc, payload);
-
-  if (error) {
-    Serial.println("Parse failed: " + String(error.f_str()));
-    setRow(1, "Parse error!");
-    delay(1000);
-    return false;
-  }
+  if (deserializeJson(doc, payload)) { setRow(1, "Parse error!"); delay(1000); return false; }
 
   totalAssignments = 0;
   hasUnanswered    = false;
-  JsonArray arr    = doc.as<JsonArray>();
 
-  Serial.println("\n=== Parsed Assignments ===");
-  int i = 1;
-  for (JsonObject obj : arr) {
+  for (JsonObject obj : doc.as<JsonArray>()) {
     if (totalAssignments >= 20) break;
-    assignments[totalAssignments].title         = obj["title"].as<String>();
-    assignments[totalAssignments].deadline      = obj["end_date"].as<String>();
-    assignments[totalAssignments].status        = obj["status"].as<String>();
-    assignments[totalAssignments].deadlineEpoch = parseDeadline(obj["end_date"].as<String>());
-    if (assignments[totalAssignments].status == "Unanswered") hasUnanswered = true;
-    Serial.println("--- #" + String(i++) + " ---");
-    Serial.println("Title   : " + assignments[totalAssignments].title);
-    Serial.println("Deadline: " + assignments[totalAssignments].deadline);
-    Serial.println("Status  : " + assignments[totalAssignments].status);
-    totalAssignments++;
+    auto& a         = assignments[totalAssignments++];
+    a.title         = obj["title"].as<String>();
+    a.deadline      = obj["end_date"].as<String>();
+    a.status        = obj["status"].as<String>();
+    a.deadlineEpoch = parseDeadline(a.deadline);
+    if (a.status == "Unanswered") hasUnanswered = true;
+    Serial.println(String(totalAssignments) + ". " + a.title + " [" + a.status + "]");
   }
-  Serial.println("==========================");
-  Serial.println("Unanswered: " + String(hasUnanswered ? "YES - PANIC MODE" : "NO"));
 
   setRow(1, "Got " + String(totalAssignments) + " tasks!");
   delay(1000);
   return true;
-}
-
-// ============================================================
-// DISPLAY
-// ============================================================
-void displayAssignment(int index) {
-  if (totalAssignments == 0) {
-    lcd.clear();
-    setRow(0, "All done! (^_^)");
-    setRow(1, "No pending tasks");
-    return;
-  }
-
-  char prefix[7];
-  snprintf(prefix, sizeof(prefix), "[%d/%d] ", index + 1, totalAssignments);
-  setRow(0, String(prefix) + assignments[index].title);
-
-  long secondsLeft = assignments[index].deadlineEpoch - getNowEpoch();
-  setRow(1, formatCountdown(secondsLeft));
-
-  Serial.println("Displaying [" + String(index + 1) + "/" + String(totalAssignments) + "] " + assignments[index].title);
 }
 
 // ============================================================
@@ -516,49 +333,31 @@ void setup() {
 
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
-  pinMode(MUTE_PIN, INPUT_PULLUP);
 
   Wire.begin(21, 22);
-  lcd.init();
-  lcd.clear();
-  lcd.backlight();
+  lcd.init(); lcd.clear(); lcd.backlight();
 
   connectWifi();
 
   if (!discoverServer()) {
-    Serial.println("Retrying discovery...");
     setRow(0, "Retrying...");
     if (!discoverServer()) {
-      lcd.clear();
-      setRow(0, "No server found!");
-      setRow(1, "Start server.py");
-      delay(3000);
-      ESP.restart();
+      lcd.clear(); setRow(0, "No server found!"); setRow(1, "Start server.py");
+      delay(3000); ESP.restart();
     }
   }
 
-  lcd.clear();
-  setRow(0, "Syncing time...");
-  setRow(1, "Please wait...");
+  lcd.clear(); setRow(0, "Syncing time..."); setRow(1, "Please wait...");
   if (!syncTime()) Serial.println("Time sync failed, using fallback.");
 
   if (fetchAssignments()) {
     displayAssignment(0);
-    if (hasUnanswered) {
-      Serial.println("UNANSWERED DETECTED. INITIATING CHAOS.");
-      beepAlert();
-    }
+    if (hasUnanswered) startAlarm();
   } else {
-    lcd.clear();
-    setRow(0, "Fetch failed!");
-    setRow(1, "Check server...");
+    lcd.clear(); setRow(0, "Fetch failed!"); setRow(1, "Check server...");
   }
 
-  lastScroll   = millis();
-  lastFetch    = millis();
-  lastMarquee  = millis();
-  lastBuzzer   = millis();
-  lastLcdChaos = millis();
+  lastScroll = lastFetch = lastMarquee = lastBuzzer = lastChaosLcd = millis();
 }
 
 // ============================================================
@@ -567,53 +366,44 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  checkMuteButton();
+  checkAlarm();
 
-  // Marquee tick
-  if (now - lastMarquee >= MARQUEE_SPEED) {
-    if (isMuted) {
-      showMuteStatus();
-    } else {
-      tickMarquee();
-    }
+  if (now - lastMarquee >= MARQUEE_MS) {
+    tickRow(0); tickRow(1);
     lastMarquee = now;
   }
 
-  // Chaos mode
-  if (hasUnanswered && !isMuted) {
+  if (hasUnanswered && alarmActive) {
     if (now - lastBuzzer >= 2500) {
       beepChaos();
       lastBuzzer = now;
     }
-
-    if (now - lastLcdChaos >= 4000) {
+    if (now - lastChaosLcd >= 4000) {
       if (showChaos) {
-        restoreNormal();
+        showChaos = false;
         displayAssignment(currentIndex);
       } else {
-        flashChaosMessage();
-        long secondsLeft = assignments[currentIndex].deadlineEpoch - getNowEpoch();
-        setRow(1, formatCountdown(secondsLeft));
+        setRow(0, String(chaosMessages[chaosLcdIndex++ % CHAOS_COUNT]));
+        setRow(1, formatCountdown(assignments[currentIndex].deadlineEpoch - nowEpoch()));
+        showChaos = true;
       }
-      lastLcdChaos = now;
+      lastChaosLcd = now;
     }
   }
 
-  // Scroll ke assignment berikutnya
-  if (now - lastScroll >= SCROLL_INTERVAL && totalAssignments > 0) {
+  if (now - lastScroll >= SCROLL_MS && totalAssignments > 0) {
     currentIndex = (currentIndex + 1) % totalAssignments;
     showChaos    = false;
     displayAssignment(currentIndex);
     lastScroll = now;
   }
 
-  // Re-fetch
-  if (now - lastFetch >= FETCH_INTERVAL) {
-    Serial.println("Re-fetching...");
+  if (now - lastFetch >= FETCH_MS) {
+    bool prev = hasUnanswered;
     if (strlen(serverURL) == 0) discoverServer();
     syncTime();
     fetchAssignments();
-    if (hasUnanswered && !isMuted) beepAlert();
+    if (hasUnanswered && (!prev || !alarmActive)) startAlarm();
     lastFetch = now;
   }
 }
