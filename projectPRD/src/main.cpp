@@ -93,11 +93,6 @@ void beepPanic() {
   for (int i = 0; i < 8; i++) { beep(p[i]); delay(g[i]); }
 }
 
-void beepChaos() {
-  beepPanic();
-  if (chaosPhase++ % 2 == 0) beepPanic();
-}
-
 // ============================================================
 // TIME
 // ============================================================
@@ -375,7 +370,7 @@ void loop() {
 
   if (hasUnanswered && alarmActive) {
     if (now - lastBuzzer >= 2500) {
-      beepChaos();
+      beepPanic();
       lastBuzzer = now;
     }
     if (now - lastChaosLcd >= 4000) {
