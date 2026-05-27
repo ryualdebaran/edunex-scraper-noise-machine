@@ -32,7 +32,6 @@ bool  hasUnanswered = false;
 bool  alarmActive   = false;
 bool  showChaos     = false;
 int   currentIndex  = 0;
-int   chaosPhase    = 0;
 int   chaosLcdIndex = 0;
 
 unsigned long lastScroll   = 0;
