@@ -23,7 +23,7 @@ edunex-scraper-noise-machine/
 │   ├── server.py                     # Flask server + UDP broadcaster
 │   ├── output.json                   # scraper output (data)
 │   ├── start.bat                     # launcher
-│   └── README.md                     # laptop-side instructions
+│   └── README.md                     
 └── README.md                         # ← you are here :)
 ```
 
