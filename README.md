@@ -8,7 +8,7 @@ ya intinya bakal ada deskripsi disini
 
 ```
 edunex-scraper-noise-machine/
-├── microcontroller code/
+├── microcontroller code/             # ← platformio project
 │   ├── .vscode/
 │   ├── include/
 │   ├── lib/
