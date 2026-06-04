@@ -10,11 +10,11 @@
 // ============================================================
 // CONFIG
 // ============================================================
-const bool TEST_MODE = false;
+const bool TEST_MODE = true;
 
 const int SCROLL_MS  = 8000;
 const int FETCH_MS   = TEST_MODE ? 120000  : 1800000;
-const int ALARM_MS   = TEST_MODE ? 60000   : 300000;
+const int ALARM_MS   = TEST_MODE ? 20000   : 300000;
 const int MARQUEE_MS = 350;
 const int BUZZER_PIN = 23;
 const int UDP_PORT   = 4210;
